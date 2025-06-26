@@ -216,9 +216,9 @@ def upload_file():
         if not company_column:
             return jsonify({'error': f'No company column found. Available: {list(df.columns)}'}), 400
         
-        # Process first 5 companies
+        # Process all companies
         results = []
-        total_companies = min(len(df), 5)
+        total_companies = len(df)
         
         for index, row in df.head(total_companies).iterrows():
             try:
