@@ -30,30 +30,63 @@ def clean_company_name(name):
     
     return name if name else None
 
-def find_emails_on_page(url, timeout=10):
+def find_emails_on_page(url, timeout=15):
+    """Find email addresses on a given webpage with improved error handling"""
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
         }
         
-        response = requests.get(url, headers=headers, timeout=timeout)
+        response = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         response.raise_for_status()
         
+        # Get text content
+        text_content = response.text.lower()
+        
+        # Find emails in the HTML content
         emails = set(EMAIL_PATTERN.findall(response.text))
         
+        # Filter out common false positives and improve filtering
         filtered_emails = []
         for email in emails:
             email_lower = email.lower()
-            if not any(x in email_lower for x in ['example.com', 'test.com', 'placeholder', 'yoursite', 'yourdomain']):
-                filtered_emails.append(email)
+            # More comprehensive filtering
+            if not any(x in email_lower for x in [
+                'example.com', 'test.com', 'placeholder', 'yoursite', 'yourdomain',
+                'sampleemail', 'noreply', 'no-reply', 'donotreply', 'do-not-reply',
+                'admin@admin', 'test@test', 'user@user', 'email@email',
+                'support@example', 'info@example', 'contact@example'
+            ]):
+                # Check if email domain matches or is related to the website domain
+                email_domain = email_lower.split('@')[1] if '@' in email_lower else ''
+                website_domain = url.split('/')[2].lower() if len(url.split('/')) > 2 else ''
+                
+                # Accept emails that are from the same domain or look legitimate
+                if email_domain and (
+                    email_domain in website_domain or 
+                    website_domain in email_domain or
+                    len(email_domain.split('.')) >= 2  # Has proper domain structure
+                ):
+                    filtered_emails.append(email)
         
         return list(set(filtered_emails))
     
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout fetching {url}")
+        return []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error fetching {url}: {str(e)}")
+        return []
     except Exception as e:
         logger.error(f"Error fetching {url}: {str(e)}")
         return []
 
 def search_company_website(company_name):
+    """Search for company website using multiple search strategies"""
     try:
         if not company_name:
             return None
@@ -62,24 +95,67 @@ def search_company_website(company_name):
         if not clean_name:
             return None
             
-        search_query = f"{clean_name} official website"
-        
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         
-        search_url = f"https://duckduckgo.com/html/?q={search_query}"
+        # Try multiple search strategies
+        search_queries = [
+            f'"{clean_name}" website',
+            f'{clean_name} official site',
+            f'{clean_name} company website',
+            f'{clean_name}'
+        ]
         
-        response = requests.get(search_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        links = soup.find_all('a', {'class': 'result__a'})
-        
-        for link in links[:3]:
-            href = link.get('href') if hasattr(link, 'get') else None
-            if href and 'http' in href:
-                return href
+        for query in search_queries:
+            try:
+                # Use DuckDuckGo Lite for better parsing
+                search_url = f"https://lite.duckduckgo.com/lite/?q={query}"
                 
+                response = requests.get(search_url, headers=headers, timeout=15)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    # Look for result links in DuckDuckGo Lite format
+                    links = soup.find_all('a')
+                    
+                    for link in links:
+                        href = link.get('href', '') if hasattr(link, 'get') else ''
+                        if isinstance(href, str) and href and href.startswith('http') and not any(x in href.lower() for x in ['duckduckgo.com', 'google.com', 'bing.com', 'yahoo.com', 'facebook.com', 'twitter.com', 'linkedin.com', 'instagram.com']):
+                            # Validate it looks like a real website
+                            domain = href.split('/')[2] if len(href.split('/')) > 2 else ''
+                            if '.' in domain and len(domain) > 3:
+                                logger.info(f"Found potential website for {clean_name}: {href}")
+                                return href
+                
+                # Small delay between search attempts
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Search attempt failed for query '{query}': {str(e)}")
+                continue
+        
+        # If no results found, try a simple Google search as fallback
+        try:
+            search_url = f"https://www.google.com/search?q={clean_name}+website"
+            response = requests.get(search_url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Look for Google result links
+                for link in soup.find_all('a'):
+                    href = link.get('href', '') if hasattr(link, 'get') else ''
+                    if isinstance(href, str) and '/url?q=' in href:
+                        # Extract actual URL from Google redirect
+                        actual_url = href.split('/url?q=')[1].split('&')[0]
+                        if actual_url.startswith('http') and not any(x in actual_url.lower() for x in ['google.com', 'facebook.com', 'twitter.com', 'linkedin.com']):
+                            logger.info(f"Found website via Google for {clean_name}: {actual_url}")
+                            return actual_url
+        except Exception as e:
+            logger.error(f"Google search fallback failed: {str(e)}")
+        
+        logger.info(f"No website found for {clean_name}")
         return None
         
     except Exception as e:
@@ -87,36 +163,57 @@ def search_company_website(company_name):
         return None
 
 def find_company_email(company_name):
+    """Find email for a company with improved search and error handling"""
     try:
         if not company_name:
             return None, None
             
         logger.info(f"Searching for emails for: {company_name}")
         
+        # Search for company website
         website = search_company_website(company_name)
         if not website:
             logger.info(f"No website found for {company_name}")
-            return None, None
+            return None, f"No website found"
         
         logger.info(f"Found website for {company_name}: {website}")
         
+        # Check main page first
         emails = find_emails_on_page(website)
         if emails:
+            logger.info(f"Found email on main page for {company_name}: {emails[0]}")
             return emails[0], f"Main page: {website}"
         
+        # Try common contact pages with better URL construction
         if isinstance(website, str):
             base_url = website.rstrip('/')
-            contact_pages = ['/contact', '/contact-us', '/about', '/about-us']
+            
+            # More comprehensive list of contact pages
+            contact_pages = [
+                '/contact', '/contact-us', '/contactus', '/contact_us',
+                '/about', '/about-us', '/aboutus', '/about_us',
+                '/team', '/staff', '/people',
+                '/info', '/information',
+                '/support', '/help'
+            ]
             
             for page in contact_pages:
                 try:
                     contact_url = base_url + page
+                    logger.info(f"Checking contact page: {contact_url}")
                     emails = find_emails_on_page(contact_url)
                     if emails:
+                        logger.info(f"Found email on contact page for {company_name}: {emails[0]}")
                         return emails[0], f"Contact page: {contact_url}"
-                except:
+                    
+                    # Small delay between page requests
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"Error checking contact page {contact_url}: {str(e)}")
                     continue
         
+        logger.info(f"No emails found for {company_name} on {website}")
         return None, f"No emails found on {website}"
         
     except Exception as e:
@@ -143,7 +240,7 @@ def index():
 <button type="submit" class="btn btn-primary btn-lg">🚀 Find Emails</button></form>
 <div id="loading" style="display:none" class="text-center mt-4">
 <div class="spinner-border text-primary"></div><h5 class="mt-3">Finding email addresses...</h5>
-<p class="text-muted">Processing first 5 companies (demo version)</p></div>
+<p class="text-muted">This may take several minutes for large files</p></div>
 <div id="results" style="display:none" class="mt-4"><div class="alert alert-success">
 <h6>✅ Processing Complete!</h6><div class="row text-center mt-3">
 <div class="col-md-4"><div style="font-size:2rem;font-weight:bold;color:#2c5aa0" id="totalCompanies">0</div><small>Companies</small></div>
@@ -216,11 +313,11 @@ def upload_file():
         if not company_column:
             return jsonify({'error': f'No company column found. Available: {list(df.columns)}'}), 400
         
-        # Process all companies
+        # Process all companies (remove 5-company limit)
         results = []
         total_companies = len(df)
         
-        for index, row in df.head(total_companies).iterrows():
+        for index, row in df.iterrows():
             try:
                 company_name_val = row[company_column]
                 if pd.isna(company_name_val) or str(company_name_val).strip() == '':
@@ -250,7 +347,7 @@ def upload_file():
         results_df.to_csv(output_path, index=False)
         
         total_processed = len(results_df)
-        emails_found = len(results_df[results_df['found_email'] != 'Not found']) if total_processed > 0 else 0
+        emails_found = len(results_df[results_df['found_email'] != 'Not found'].index) if total_processed > 0 else 0
         success_rate = (emails_found / total_processed * 100) if total_processed > 0 else 0
         
         return jsonify({
